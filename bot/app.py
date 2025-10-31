@@ -4,10 +4,13 @@ import base64
 import imghdr
 import logging
 import time
+import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence
 
-from requests import HTTPError
+import requests
+from requests import HTTPError, RequestException
 
 from .config import Settings, get_settings
 from .openai_client import OpenAIClient
@@ -17,19 +20,25 @@ logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = (
-    "Voce e um assistente virtual universitario que responde sempre em portugues do Brasil. "
-    "Use um tom acolhedor e objetivo, explique conceitos de forma simples e ofereca exemplos "
-    "quando fizer sentido. Caso nao saiba a resposta, admita e sugira caminhos para pesquisar."
+    "Voce e um atendente virtual brasileiro, cordial e organizado, que responde sempre em portugues do Brasil. "
+    "Mantenha um tom humano, empatico e claro, estruturando as respostas em paragrafos curtos ou listas quando ajudar na compreensao. "
+    "Explique conceitos de forma simples, ofereca exemplos praticos quando fizer sentido e confirme se a pessoa ficou satisfeita com a solucao. "
+    "Deixe claro que voce e um bot especializado em tirar duvidas e consultar cotacoes de moedas, entregando informacoes em tempo real sempre que for solicitado. "
+    "Quando nao souber a resposta, admita a limitacao e sugira fontes confiaveis para pesquisa. "
+    "Sempre que perguntarem sobre suas capacidades, informe que consegue entender mensagens escritas, audios (transcrevendo-os automaticamente) e imagens. "
+    "Caso receba dados em tempo real (como cotacoes), incorpore-os de maneira clara destacando a fonte."
 )
 
 HELP_TEXT = (
     "Envie perguntas, audios ou imagens e eu responderei usando a API da OpenAI.\n"
-    "Audios sao transcritos automaticamente e imagens sao analisadas pelo modelo multimodal.\n"
+    "Sou um bot tira-duvidas que tambem consulta cotacoes de moedas em tempo real, ideal para acompanhar dolar, euro e outras moedas.\n"
+    "Audios sao transcritos automaticamente, imagens sao analisadas pelo modelo multimodal e voce pode usar o menu para verificar cotacoes a qualquer momento.\n"
     "\n"
     "Comandos disponiveis:\n"
     "/start - mensagem de boas-vindas\n"
     "/help - guia rapido\n"
     "/menu - exibe os atalhos principais\n"
+    "/cotacoes - mostra as principais moedas em tempo real\n"
     "/reset - limpa o historico da conversa"
 )
 
@@ -41,8 +50,11 @@ ABOUT_TEXT = (
 
 MENU_KEYBOARD = [
     ["Conversar com IA"],
+    ["Verificar cotacoes"],
     ["Ajuda", "Resetar conversa"],
 ]
+
+DEFAULT_CURRENCY_CODES = ["USD", "EUR", "GBP"]
 
 
 @dataclass
@@ -229,6 +241,9 @@ class BotApp:
         if command == "/menu":
             self._send_menu(chat_id)
             return
+        if command == "/cotacoes":
+            self._send_currency_snapshot(chat_id, DEFAULT_CURRENCY_CODES, reply_to=message_id)
+            return
         if command == "/reset":
             state.reset()
             self.telegram.send_message(chat_id, "Historico apagado. Podemos recomecar!", reply_to=message_id)
@@ -251,6 +266,9 @@ class BotApp:
         if normalized == "conversar com ia":
             self.telegram.send_message(chat_id, "Ok, me conte como posso ajudar hoje.", reply_to=message_id)
             return True
+        if normalized == "verificar cotacoes":
+            self._send_currency_snapshot(chat_id, DEFAULT_CURRENCY_CODES, reply_to=message_id)
+            return True
         return False
 
     def _flush_buffers_if_needed(self) -> None:
@@ -268,6 +286,10 @@ class BotApp:
         message = state.consume_pending()
         if not message:
             return
+
+        context = self._build_realtime_context(message)
+        if context:
+            self._append_context_to_message(message, context)
 
         self.telegram.send_chat_action(chat_id, "typing")
 
@@ -390,8 +412,8 @@ class BotApp:
 
     def _send_welcome(self, chat_id: int, message_id: int) -> None:
         welcome_text = (
-            "Ola! Eu sou seu assistente virtual integrado com a OpenAI. "
-            "Posso tirar duvidas, explicar conceitos ou dar ideias para seus projetos. "
+            "Ola! Eu sou seu assistente virtual integrado com a OpenAI, especializado em tirar duvidas e trazer cotacoes em tempo real. "
+            "Posso explicar conceitos, trazer ideias para seus projetos e informar o valor atual de moedas como dolar, euro e mais. "
             "Use o menu para ver atalhos rapidos ou simplesmente me envie uma mensagem."
         )
         self.telegram.send_message(chat_id, welcome_text, reply_to=message_id)
@@ -400,6 +422,212 @@ class BotApp:
     def _send_menu(self, chat_id: int) -> None:
         self.telegram.send_message(
             chat_id,
-            "Selecione um atalho ou envie sua mensagem:",
+            "Selecione um atalho ou envie sua mensagem. O bot tambem pode verificar cotacoes em tempo real:",
             keyboard=MENU_KEYBOARD,
         )
+
+    def _send_currency_snapshot(
+        self,
+        chat_id: int,
+        codes: Sequence[str],
+        reply_to: Optional[int] = None,
+    ) -> None:
+        try:
+            context = self._fetch_currency_data(codes)
+        except (RequestException, ValueError) as exc:
+            logger.warning("Falha ao buscar cotacoes para menu: %s", exc)
+            message = (
+                "Nao consegui consultar as cotacoes agora. "
+                "Tente novamente em instantes."
+            )
+            self.telegram.send_message(chat_id, message, reply_to=reply_to)
+            return
+
+        if not context:
+            self.telegram.send_message(
+                chat_id,
+                "Nao encontrei cotacoes atualizadas neste momento, mas posso tentar novamente se voce quiser.",
+                reply_to=reply_to,
+            )
+            return
+
+        if context.startswith("[Contexto em tempo real]"):
+            lines = context.splitlines()[1:]
+            if lines and lines[0].lower().startswith("cotacoes consultadas"):
+                lines = lines[1:]
+            formatted = "\n".join(lines).strip()
+        else:
+            formatted = context.strip()
+
+        if not formatted:
+            formatted = "Nao recebi valores do servico externo desta vez."
+
+        message = "Cotacoes em tempo real via AwesomeAPI:\n" + formatted
+        self.telegram.send_message(chat_id, message, reply_to=reply_to)
+
+    def _build_realtime_context(self, message: Dict[str, Any]) -> Optional[str]:
+        content = message.get("content")
+        text_fragments = self._extract_text_fragments(content)
+        if not text_fragments:
+            return None
+
+        normalized = self._normalize_text(" ".join(text_fragments))
+        currency_codes = self._detect_currency_codes(normalized)
+        if not currency_codes:
+            return None
+
+        try:
+            data_context = self._fetch_currency_data(currency_codes)
+        except (RequestException, ValueError) as exc:  # pragma: no cover - external service may fail
+            logger.warning("Falha ao buscar cotacoes: %s", exc)
+            return (
+                "[Contexto em tempo real]\n"
+                "Solicitei cotacoes de moedas, mas o servico externo nao respondeu. "
+                "Explique ao usuario que pode tentar novamente em instantes."
+            )
+
+        return data_context
+
+    @staticmethod
+    def _append_context_to_message(message: Dict[str, Any], context: str) -> None:
+        if not context:
+            return
+
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = f"{content}\n\n{context}" if content else context
+            return
+
+        if isinstance(content, list):
+            content.append({"type": "text", "text": context})
+            return
+
+        message["content"] = context
+
+    @staticmethod
+    def _extract_text_fragments(content: Any) -> List[str]:
+        if isinstance(content, str):
+            stripped = content.strip()
+            return [stripped] if stripped else []
+
+        fragments: List[str] = []
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    text_value = str(part.get("text", "")).strip()
+                    if text_value:
+                        fragments.append(text_value)
+        return fragments
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        normalized = unicodedata.normalize("NFD", text)
+        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+        return ascii_text.lower()
+
+    @staticmethod
+    def _detect_currency_codes(normalized_text: str) -> List[str]:
+        keywords = {
+            "dolar": "USD",
+            "usd": "USD",
+            "euro": "EUR",
+            "eur": "EUR",
+            "libra": "GBP",
+            "gbp": "GBP",
+            "iene": "JPY",
+            "jpy": "JPY",
+            "peso": "ARS",
+            "ars": "ARS",
+            "bitcoin": "BTC",
+            "btc": "BTC",
+        }
+
+        detected: set[str] = set()
+        for keyword, code in keywords.items():
+            if keyword in normalized_text:
+                detected.add(code)
+
+        if "cotacao" in normalized_text or "cambio" in normalized_text:
+            detected.update({"USD", "EUR"})
+
+        return sorted(detected)
+
+    def _fetch_currency_data(self, codes: Sequence[str]) -> Optional[str]:
+        if not codes:
+            return None
+
+        pairs = ",".join(f"{code}-BRL" for code in codes)
+        url = f"https://economia.awesomeapi.com.br/json/last/{pairs}"
+
+        response = requests.get(url, timeout=self.settings.request_timeout)
+        response.raise_for_status()
+        payload = response.json()
+
+        lines: List[str] = []
+        timestamp_display: Optional[str] = None
+
+        for code in codes:
+            key = f"{code}BRL"
+            info = payload.get(key)
+            if not isinstance(info, dict):
+                continue
+
+            price_raw = info.get("bid") or info.get("ask")
+            variation_raw = info.get("pctChange")
+            update_reference = info.get("create_date") or info.get("timestamp")
+
+            if price_raw is None:
+                continue
+
+            try:
+                price_value = float(str(price_raw).replace(",", "."))
+                price_text = f"R$ {price_value:.4f}"
+            except (TypeError, ValueError):
+                price_text = str(price_raw)
+
+            variation_text = ""
+            if variation_raw is not None:
+                try:
+                    variation_value = float(str(variation_raw).replace(",", "."))
+                    variation_text = f" (variacao diaria: {variation_value:+.2f}%)"
+                except (TypeError, ValueError):
+                    variation_text = f" (variacao diaria: {variation_raw})"
+
+            if update_reference and not timestamp_display:
+                timestamp_display = self._format_timestamp(update_reference)
+
+            lines.append(f"- {code}/BRL: {price_text}{variation_text}")
+
+        if not lines:
+            return None
+
+        header = "[Contexto em tempo real]\nCotacoes consultadas via AwesomeAPI:"
+        body = "\n".join(lines)
+        if timestamp_display:
+            return f"{header}\n{body}\nDados consultados em {timestamp_display}."
+        return f"{header}\n{body}"
+
+    @staticmethod
+    def _format_timestamp(value: Any) -> str:
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(float(value))
+            return dt.strftime("%d/%m/%Y %H:%M:%S")
+
+        text = str(value)
+        if text.isdigit():
+            try:
+                dt = datetime.fromtimestamp(int(text))
+                return dt.strftime("%d/%m/%Y %H:%M:%S")
+            except (OSError, OverflowError, ValueError):
+                return text
+
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%z"):
+            try:
+                dt = datetime.strptime(text, fmt)
+                return dt.strftime("%d/%m/%Y %H:%M:%S")
+            except ValueError:
+                continue
+
+        return text

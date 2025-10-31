@@ -6,8 +6,10 @@ Este projeto entrega um bot de Telegram que conversa com usuarios usando a API p
 - Estrutura em modulos (`bot/`) separando configuracao, cliente do Telegram e cliente da OpenAI.
 - Historico por chat guardado em memoria para respostas mais naturais.
 - Transcricao de audios (voz ou arquivos) usando Whisper via OpenAI e analise de imagens com o modelo multimodal.
+- Respostas humanizadas com tom acolhedor e organizacao em listas/paragrafos curtos.
 - Buffer inteligente: o bot espera alguns segundos antes de responder, agrupando mensagens consecutivas.
-- Teclado de atalhos com comandos frequentes (/start, /help, /reset).
+- Teclado de atalhos com comandos frequentes (/start, /help, /cotacoes, /reset) e botao "Verificar cotacoes" sempre disponivel no menu.
+- Consulta cotacoes de moedas em tempo real (USD, EUR, GBP, JPY, ARS, BTC vs. BRL) usando a AwesomeAPI, tanto automaticamente quando o usuario pergunta quanto sob demanda pelo menu.
 - Configuracao via `.env` (exemplo em `.env.example`) para manter tokens fora do codigo.
 
 ## Requisitos
@@ -41,6 +43,19 @@ python main.py
 ```
 
 O bot usa long polling; deixe o processo rodando e envie mensagens pelo Telegram.
+
+## Publicando no GitHub
+O projeto ainda nao foi enviado para nenhum repositorio remoto. Para subir no seu GitHub:
+
+1. Crie um repositório vazio na sua conta (sem README licenca ou .gitignore).
+2. No terminal, defina o remoto e envie o historico:
+   ```bash
+   git remote add origin https://github.com/<seu-usuario>/<seu-repo>.git
+   git push -u origin work
+   ```
+3. Caso prefira usar `main` ou `master`, ajuste o nome da branch local antes do push (`git branch -m work main`).
+
+Isso garantira que o mesmo codigo presente aqui fique disponivel no GitHub.
 
 ## Estrutura dos arquivos
 ```
