@@ -1,108 +1,97 @@
 # Bot Telegram + OpenAI
 
-![Bot waving friendly](https://media.giphy.com/media/xT0xeJpnrWC4XWblEk/giphy.gif)
+Assistente virtual em portugues que conversa no Telegram, entende texto, audio e imagem, e responde usando a OpenAI com direito a contexto de cotacoes em tempo real.
 
-Assistente virtual multimodal que junta Telegram, OpenAI e dados em tempo real em uma experiencia dinamica. Pense nele como um bot-animador: entende texto, audio, imagem e responde com contexto vivo e boa educacao.
+## Essencia do Projeto
+- **Entrada multicanal**: texto, voz e imagens sao tratados sem comandos complexos.
+- **Contexto vivo**: detecta pedidos de cotacao e consulta a AwesomeAPI antes de falar com a IA.
+- **Fluxo modular**: cada responsabilidade fica em um arquivo especifico dentro de `bot/`.
+- **Seguranca**: chaves e tokens ficam em `.env`, longe do codigo versionado.
 
-## Visao Geral Cinematica
-![Movie timeline animation](https://media.giphy.com/media/3oKIPtjElfqwMOTbH2/giphy.gif)
+## Fluxo de Mensagens
+1. `main.py` cria uma instacia de `BotApp` e inicia o polling no Telegram.
+2. `BotApp.run()` busca atualizacoes com `getUpdates` e distribui cada mensagem para `_handle_update`.
+3. `ChatState` registra o historico individual e acumula novas partes (texto, audio, imagem) em `pending_parts`.
+4. Quando o buffer atinge o intervalo configurado (`RESPONSE_BUFFER_SECONDS`), `_reply_with_buffer` monta o prompt final.
+5. `_build_realtime_context` detecta moedas mencionadas e adiciona dados recentes da AwesomeAPI.
+6. `OpenAIClient.generate_reply` envia historico + contexto para a OpenAI e retorna a resposta.
+7. `TelegramClient.sendMessage` responde ao usuario mantendo a thread correta.
 
+## Buffer Inteligente (exemplo)
 ```
-main.py  -> liga o BotApp e inicia o polling
-bot/app.py -> core: buffer, midias, fluxos e chamadas OpenAI
-bot/telegram_client.py -> integra com a API do Telegram (updates, menus, arquivos)
-bot/openai_client.py -> conversa com a OpenAI e transcreve audios
-bot/config.py -> carrega variaveis (.env) e valida configuracao
+tempo   entrada                          acao
+0.0 s   "oi bot!"                        guardado em pending_parts
+0.9 s   mensagem de voz                  baixada, transcrita e anexada como texto
+1.6 s   foto com legenda                 baixada, convertida para data:image/... e anexada
+2.7 s   nenhum novo update               buffer dispara, prompt completo segue para a OpenAI
 ```
+Beneficios: menos chamadas para a OpenAI, respostas mais completas e conversas fluindo naturalmente.
 
-### Fluxo Cena a Cena
-1. Usuario envia texto, audio ou imagem no Telegram.
-2. `BotApp.run()` captura o update via `getUpdates` (long polling).
-3. `ChatState` guarda historico e monta um buffer com as partes recebidas.
-4. `_build_realtime_context` detecta pedidos de cotacao e consulta a AwesomeAPI.
-5. `OpenAIClient.generate_reply` monta a resposta final com historico + contexto recente.
-6. `TelegramClient.sendMessage` entrega a mensagem na thread correta e o ciclo continua.
+## Suporte Multimodal
+- **Texto**: processado imediatamente; atalhos reconhecem palavras como "Ajuda" ou "Verificar cotacoes".
+- **Audio**: `_process_voice_message` baixa o arquivo, identifica o MIME, transcreve com Whisper (`OpenAIClient.transcribe_audio`) e adiciona a transcricao ao prompt.
+- **Imagem**: `_queue_image_from_file` faz download, gera Base64, detecta o tipo (`_guess_image_mime`) e inclui a imagem no prompt multimodal, com legenda opcional.
 
-![Loop animation](https://media.giphy.com/media/l0HlAvv7T8EMbG7Rm/giphy.gif)
-
-## Buffer em Slow Motion
+## Comandos e Atalhos
 ```
-tempo   evento                          efeito
-0.0s    usuario: "oi bot!"              -> vira texto no pending_parts
-0.8s    usuario: audio explicando      -> baixa, transcreve, adiciona "[Audio do usuario]"
-1.5s    usuario: imagem (print)        -> baixa, converte para data:image/... e coloca no prompt
-2.6s    pausa maior que RESPONSE_BUFFER_SECONDS
-        _reply_with_buffer consolida tudo, inclui contexto de cotacoes e chama a OpenAI
-```
-Esse mini delay gera respostas completas, poucas chamadas de IA e conversas naturais (sem spam de respostas picadas).
-
-## Multimodal Showroom
-![Multimodal animation](https://media.giphy.com/media/xT39CVZFTx9X9vB5qM/giphy.gif)
-
-- **Audio**: `_process_voice_message` baixa o arquivo, detecta MIME, transcreve com `OpenAIClient.transcribe_audio` e injeta o texto no prompt.
-- **Imagem**: `_queue_image_from_file` baixa, converte para Base64 e manda para o modelo multimodal com a legenda ou um prompt padrao.
-- **Texto**: entra direto no buffer; atalhos como "Verificar cotacoes" saltam direto para a resposta pronta.
-
-## Painel de Comandos
-```
-| comando / atalho             | acao                                                                 |
-|------------------------------|----------------------------------------------------------------------|
-| /start                       | Mostra boas-vindas + teclado principal                              |
-| /help ou "Ajuda"             | Guia rapido com tudo que o bot faz                                  |
-| /cotacoes                    | Consulta USD, EUR e GBP vs BRL via AwesomeAPI                       |
-| /reset ou "Resetar conversa" | Limpa historico do chat e recomeca                                  |
-| /sobre                       | Bastidores do projeto                                               |
-| "Conversar com IA"           | Confirma que o bot esta ouvindo                                     |
-| "Verificar cotacoes"         | Consulta de moedas sem precisar digitar comando                     |
+| comando / atalho             | acao                                                          |
+|------------------------------|---------------------------------------------------------------|
+| /start                       | Mensagem de boas-vindas e teclado principal                   |
+| /help ou "Ajuda"             | Guia rapido com recursos disponiveis                          |
+| /cotacoes                    | Consulta USD, EUR e GBP contra BRL                            |
+| /reset ou "Resetar conversa" | Limpa historico do chat atual                                 |
+| /sobre                       | Mostra um resumo do projeto                                   |
+| "Conversar com IA"           | Confirma ao usuario que o bot esta pronto para ouvir          |
+| "Verificar cotacoes"         | Dispara consulta de moedas via menu sem precisar de comando   |
 ```
 
-## Setup Turbo
-![Rocket launch animation](https://media.giphy.com/media/26ufdipQqU2lhNA4g/giphy.gif)
-
-```
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-```
-
-Preencha `.env`:
-- `TELEGRAM_BOT_TOKEN` (pego com o BotFather)
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL` (padrao `gpt-4o-mini`)
-- `OPENAI_TRANSCRIPTION_MODEL` (padrao `gpt-4o-mini-transcribe`)
-- `RESPONSE_BUFFER_SECONDS` (ex.: `3` para agrupar mensagem em ~3 segundos)
-
-> `.env` ja esta listado no `.gitignore`. Nunca envie suas chaves para o repositorio.
-
-Execute:
-```
-python main.py
-```
-Deixe rodando e fale com o bot no Telegram. Logs em nivel INFO mostram cada etapa (updates, chamadas, erros externos).
-
-## Bastidores (Blueprint)
+## Estrutura do Projeto
 ```
 bot/
-  app.py            <- loop principal, buffer, midias, cotacoes, OpenAI
-  config.py         <- variaveis de ambiente e validacao
-  openai_client.py  <- Chat Completions e Whisper
-  telegram_client.py<- requests com retry, menus e download de arquivos
-main.py             <- ponto de entrada
-requirements.txt    <- dependencias
-.env.example        <- modelo de configuracao
+  app.py            # Loop principal, buffer, midias, cotacoes, chamadas OpenAI
+  config.py         # Carrega variaveis de ambiente e valida configuracao
+  openai_client.py  # Chat Completions e transcricao de audio
+  telegram_client.py# Cliente HTTP com retries, menus e downloads
+main.py             # Ponto de entrada que inicia o bot
+requirements.txt    # Dependencias do projeto
+.env.example        # Modelo de configuracao
 ```
 
-## Hints de Customizacao
-- Ajuste o `SYSTEM_PROMPT` se quiser um bot mais tecnico, informal ou corporativo.
-- Modifique `DEFAULT_CURRENCY_CODES` para trocar as moedas de destaque.
-- Escreva novos atalhos alterando `MENU_KEYBOARD`.
-- Acrescente outros blocos de contexto em `_build_realtime_context` para integrar novas APIs (clima, noticias, status interno...).
+## Configuracao e Execucao
+1. Crie um ambiente virtual e instale dependencias:
+   ```
+   python -m venv .venv
+   .venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+2. Copie e edite o arquivo de variaveis:
+   ```
+   copy .env.example .env
+   ```
+   Preencha:
+   - `TELEGRAM_BOT_TOKEN`
+   - `OPENAI_API_KEY`
+   - `OPENAI_MODEL` (padrao `gpt-4o-mini`)
+   - `OPENAI_TRANSCRIPTION_MODEL` (padrao `gpt-4o-mini-transcribe`)
+   - `RESPONSE_BUFFER_SECONDS` (ex.: `3` para agrupar mensagens por cerca de 3 segundos)
+3. Execute o bot:
+   ```
+   python main.py
+   ```
+   O processo usa long polling. Mantenha o terminal aberto e converse com o bot no Telegram.
+
+> `.env` continua ignorado pelo Git. Guarde seus tokens com cuidado.
+
+## Personalizacao Recomendada
+- Ajuste o `SYSTEM_PROMPT` em `bot/app.py` para alterar estilo e tom das respostas.
+- Modifique `DEFAULT_CURRENCY_CODES` para incluir outras moedas ou criptos de interesse.
+- Adapte `MENU_KEYBOARD` com atalhos proprios do seu projeto.
+- Acrescente novos blocos em `_build_realtime_context` para integrar APIs adicionais (clima, noticias, dados internos).
 
 ## Checklist Final
-- [ ] Dependencias instaladas no ambiente virtual
-- [ ] `.env` configurado com tokens validos
-- [ ] `python main.py` em execucao sem erros
-- [ ] Testes com texto, audio e imagem realizados
+- [ ] Dependencias instaladas e ambiente virtual ativo
+- [ ] `.env` preenchido com tokens validos
+- [ ] Bot em execucao com `python main.py`
+- [ ] Testes de texto, audio e imagem confirmando funcionamento
 - [ ] Cotacoes retornando dados da AwesomeAPI
-- [ ] README pronto para apresentar o projeto
+- [ ] README suficientemente claro para apresentar o projeto
