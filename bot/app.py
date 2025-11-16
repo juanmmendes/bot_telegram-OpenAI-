@@ -3,17 +3,20 @@ from __future__ import annotations
 import base64
 import imghdr
 import logging
+import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
-import requests
 from requests import HTTPError, RequestException
 
 from .config import Settings, get_settings
+from .observability import MetricsRecorder
 from .openai_client import OpenAIClient
+from .services import CurrencyService
+from .state_store import BaseStateStore, create_state_store
 from .telegram_client import TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -26,12 +29,14 @@ SYSTEM_PROMPT = (
     "Deixe claro que voce e um bot especializado em tirar duvidas e consultar cotacoes de moedas, entregando informacoes em tempo real sempre que for solicitado. "
     "Quando nao souber a resposta, admita a limitacao e sugira fontes confiaveis para pesquisa. "
     "Sempre que perguntarem sobre suas capacidades, informe que consegue entender mensagens escritas, audios (transcrevendo-os automaticamente) e imagens. "
-    "Caso receba dados em tempo real (como cotacoes), incorpore-os de maneira clara destacando a fonte."
+    "Caso receba dados em tempo real (como cotacoes), incorpore-os de maneira clara destacando a fonte. "
+    "Ao receber cotacoes antigas do Banco Central (PTAX), lembre o usuario da data solicitada e que os valores sao oficiais."
 )
 
 HELP_TEXT = (
     "Envie perguntas, audios ou imagens e eu responderei usando a API da OpenAI.\n"
     "Sou um bot tira-duvidas que tambem consulta cotacoes de moedas em tempo real, ideal para acompanhar dolar, euro e outras moedas.\n"
+    "Para valores passados, mencione a moeda e a data (ex.: 'cotacao do dolar em 03/06/2024') que busco a PTAX oficial do Banco Central.\n"
     "Audios sao transcritos automaticamente, imagens sao analisadas pelo modelo multimodal e voce pode usar o menu para verificar cotacoes a qualquer momento.\n"
     "\n"
     "Comandos disponiveis:\n"
@@ -129,6 +134,26 @@ class ChatState:
         self._trim()
         return message
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "messages": self.messages,
+            "pending_parts": self.pending_parts,
+            "last_message_id": self.last_message_id,
+            "last_update_ts": self.last_update_ts,
+            "waiting_reply": self.waiting_reply,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ChatState":
+        instance = cls()
+        instance.messages = payload.get("messages") or [{"role": "system", "content": SYSTEM_PROMPT}]
+        instance.pending_parts = payload.get("pending_parts", [])
+        instance.last_message_id = payload.get("last_message_id")
+        instance.last_update_ts = payload.get("last_update_ts")
+        instance.waiting_reply = payload.get("waiting_reply", False)
+        instance._trim()
+        return instance
+
     def should_flush(self, buffer_seconds: float) -> bool:
         if not self.waiting_reply or not self.pending_parts:
             return False
@@ -147,6 +172,9 @@ class ChatState:
 class BotApp:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self.metrics = MetricsRecorder(self.settings.metrics_file_path)
+        self.state_store: BaseStateStore = create_state_store(self.settings.chat_state_dir)
+        self.currency = CurrencyService(request_timeout=self.settings.request_timeout)
         self.telegram = TelegramClient(
             token=self.settings.telegram_bot_token,
             request_timeout=self.settings.request_timeout,
@@ -155,9 +183,11 @@ class BotApp:
             api_key=self.settings.openai_api_key,
             model=self.settings.openai_model,
             transcription_model=self.settings.openai_transcription_model,
+            metrics=self.metrics,
         )
         self.response_buffer_seconds = self.settings.response_buffer_seconds
         self.chat_states: Dict[int, ChatState] = {}
+        self._hydrate_states()
 
     def run(self) -> None:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -195,6 +225,7 @@ class BotApp:
                 break
             except Exception as exc:
                 logger.exception("Erro no loop principal: %s", exc)
+                self.metrics.record_error("main_loop_exception")
                 time.sleep(1.5)
                 self._flush_buffers_if_needed()
 
@@ -209,7 +240,10 @@ class BotApp:
 
         chat_id = int(chat["id"])
         message_id = int(message.get("message_id", 0))
-        state = self.chat_states.setdefault(chat_id, ChatState())
+        self.metrics.record_update(chat_id)
+        logger.info("Mensagem recebida", extra={"chat_id": chat_id, "message_id": message_id})
+
+        state = self._get_chat_state(chat_id)
         state.last_message_id = message_id
 
         text = (message.get("text") or "").strip()
@@ -217,42 +251,54 @@ class BotApp:
 
         command_text = text or caption
         if command_text.startswith("/"):
-            self._handle_command(chat_id, message_id, command_text, state)
+            if self._handle_command(chat_id, message_id, command_text, state):
+                self._persist_state(chat_id, state)
             return
 
         if text and self._handle_shortcut(chat_id, message_id, text, state):
+            self._persist_state(chat_id, state)
             return
 
+        state_mutated = False
         media_handled = False
-        media_handled = self._process_voice_message(chat_id, message, state) or media_handled
-        media_handled = self._process_image_message(chat_id, message, state) or media_handled
+        voice_handled = self._process_voice_message(chat_id, message, state)
+        media_handled = voice_handled or media_handled
+        state_mutated = state_mutated or voice_handled
+        image_handled = self._process_image_message(chat_id, message, state)
+        media_handled = image_handled or media_handled
+        state_mutated = state_mutated or image_handled
 
         if text and not media_handled:
             state.queue_text(text)
+            state_mutated = True
 
-    def _handle_command(self, chat_id: int, message_id: int, text: str, state: ChatState) -> None:
+        if state_mutated:
+            self._persist_state(chat_id, state)
+
+    def _handle_command(self, chat_id: int, message_id: int, text: str, state: ChatState) -> bool:
         command = text.split()[0].lower()
         if command == "/start":
             self._send_welcome(chat_id, message_id)
-            return
+            return False
         if command == "/help":
             self.telegram.send_message(chat_id, HELP_TEXT, reply_to=message_id)
-            return
+            return False
         if command == "/menu":
             self._send_menu(chat_id)
-            return
+            return False
         if command == "/cotacoes":
             self._send_currency_snapshot(chat_id, DEFAULT_CURRENCY_CODES, reply_to=message_id)
-            return
+            return False
         if command == "/reset":
             state.reset()
             self.telegram.send_message(chat_id, "Historico apagado. Podemos recomecar!", reply_to=message_id)
-            return
+            return True
         if command == "/sobre":
             self.telegram.send_message(chat_id, ABOUT_TEXT, reply_to=message_id)
-            return
+            return False
 
         self.telegram.send_message(chat_id, "Comando nao reconhecido. Use /help para ver as opcoes.", reply_to=message_id)
+        return False
 
     def _handle_shortcut(self, chat_id: int, message_id: int, text: str, state: ChatState) -> bool:
         normalized = text.lower()
@@ -282,10 +328,51 @@ class BotApp:
             return min(self.settings.polling_timeout, short_timeout)
         return self.settings.polling_timeout
 
+    def _hydrate_states(self) -> None:
+        for chat_id in self.state_store.list_chat_ids():
+            payload = self.state_store.load(chat_id)
+            if not payload:
+                continue
+            try:
+                self.chat_states[chat_id] = ChatState.from_dict(payload)
+            except Exception as exc:  # pragma: no cover - defensive path
+                logger.warning("Falha ao carregar estado do chat %s: %s", chat_id, exc)
+
+    def _get_chat_state(self, chat_id: int) -> ChatState:
+        state = self.chat_states.get(chat_id)
+        if state:
+            return state
+        payload = self.state_store.load(chat_id)
+        if payload:
+            try:
+                state = ChatState.from_dict(payload)
+            except Exception as exc:  # pragma: no cover - defensive path
+                logger.warning("Estado serializado invalido para chat %s: %s", chat_id, exc)
+                state = ChatState()
+        else:
+            state = ChatState()
+        self.chat_states[chat_id] = state
+        return state
+
+    def _persist_state(self, chat_id: int, state: ChatState) -> None:
+        try:
+            self.state_store.save(chat_id, state.to_dict())
+        except Exception as exc:  # pragma: no cover - defensive path
+            logger.warning("Nao foi possivel persistir estado do chat %s: %s", chat_id, exc)
+
+    def _delete_state(self, chat_id: int) -> None:
+        self.chat_states.pop(chat_id, None)
+        try:
+            self.state_store.delete(chat_id)
+        except Exception as exc:  # pragma: no cover - defensive path
+            logger.warning("Falha ao remover estado persistido do chat %s: %s", chat_id, exc)
+
     def _reply_with_buffer(self, chat_id: int, state: ChatState) -> None:
         message = state.consume_pending()
         if not message:
             return
+
+        self._persist_state(chat_id, state)
 
         context = self._build_realtime_context(message)
         if context:
@@ -297,6 +384,7 @@ class BotApp:
             reply = self.openai.generate_reply(state.messages)
         except Exception as exc:
             logger.exception("Falha ao chamar a OpenAI: %s", exc)
+            self.metrics.record_error("openai_call")
             fallback = (
                 "Tive um problema para falar com a IA agora. "
                 "Tente novamente em instantes ou envie a mensagem mais tarde."
@@ -305,6 +393,7 @@ class BotApp:
             return
 
         state.add_assistant(reply)
+        self._persist_state(chat_id, state)
         self.telegram.send_message(chat_id, reply, reply_to=state.last_message_id, parse_mode=None)
 
     def _process_voice_message(self, chat_id: int, message: Dict[str, Any], state: ChatState) -> bool:
@@ -323,6 +412,7 @@ class BotApp:
             transcription = self.openai.transcribe_audio(audio_bytes, mime_type)
         except Exception as exc:
             logger.exception("Erro ao processar audio: %s", exc)
+            self.metrics.record_error("audio_processing")
             self.telegram.send_message(
                 chat_id,
                 "Nao consegui entender o audio agora. Pode tentar novamente ou enviar em texto?",
@@ -369,6 +459,7 @@ class BotApp:
             image_b64 = base64.b64encode(image_bytes).decode("ascii")
         except Exception as exc:
             logger.exception("Erro ao baixar imagem: %s", exc)
+            self.metrics.record_error("image_processing")
             self.telegram.send_message(
                 chat_id,
                 "Nao consegui abrir a imagem que voce enviou. Pode tentar novamente?",
@@ -433,9 +524,10 @@ class BotApp:
         reply_to: Optional[int] = None,
     ) -> None:
         try:
-            context = self._fetch_currency_data(codes)
+            context = self.currency.fetch_currency_snapshot(codes)
         except (RequestException, ValueError) as exc:
             logger.warning("Falha ao buscar cotacoes para menu: %s", exc)
+            self.metrics.record_error("currency_lookup")
             message = (
                 "Nao consegui consultar as cotacoes agora. "
                 "Tente novamente em instantes."
@@ -444,6 +536,7 @@ class BotApp:
             return
 
         if not context:
+            self.metrics.record_error("currency_lookup_empty")
             self.telegram.send_message(
                 chat_id,
                 "Nao encontrei cotacoes atualizadas neste momento, mas posso tentar novamente se voce quiser.",
@@ -476,10 +569,44 @@ class BotApp:
         if not currency_codes:
             return None
 
+        reference_date = self._detect_reference_date(normalized)
+        if reference_date:
+            today = datetime.now().date()
+            reference_display = reference_date.strftime("%d/%m/%Y")
+
+            if reference_date > today:
+                return (
+                    "[Contexto historico]\n"
+                    f"O usuario pediu cotacoes para {reference_display}, uma data futura. "
+                    "Explique que apenas datas ate hoje estao disponiveis."
+                )
+
+            try:
+                historical_context = self.currency.fetch_historical_snapshot(currency_codes, reference_date)
+            except (RequestException, ValueError) as exc:  # pragma: no cover - external service may fail
+                logger.warning("Falha ao buscar cotacoes historicas: %s", exc)
+                self.metrics.record_error("currency_context_ptax")
+                return (
+                    "[Contexto historico]\n"
+                    f"Tentei consultar o Banco Central para {reference_display}, mas ocorreu um erro externo. "
+                    "Avise que o usuario pode tentar novamente em instantes."
+                )
+
+            if historical_context:
+                return historical_context
+
+            self.metrics.record_error("currency_context_ptax_empty")
+            return (
+                "[Contexto historico]\n"
+                f"Nao encontrei cotacoes oficiais do Banco Central para {reference_display} apos checar alguns dias uteis. "
+                "Explique que apenas datas uteis com divulgacao da PTAX estao disponiveis."
+            )
+
         try:
-            data_context = self._fetch_currency_data(currency_codes)
+            data_context = self.currency.fetch_currency_snapshot(currency_codes)
         except (RequestException, ValueError) as exc:  # pragma: no cover - external service may fail
             logger.warning("Falha ao buscar cotacoes: %s", exc)
+            self.metrics.record_error("currency_context")
             return (
                 "[Contexto em tempo real]\n"
                 "Solicitei cotacoes de moedas, mas o servico externo nao respondeu. "
@@ -528,6 +655,73 @@ class BotApp:
         return ascii_text.lower()
 
     @staticmethod
+    def _detect_reference_date(normalized_text: str) -> Optional[date]:
+        relative_keywords = (("anteontem", 2), ("ontem", 1))
+        today = datetime.now().date()
+        for keyword, days in relative_keywords:
+            if keyword in normalized_text:
+                return today - timedelta(days=days)
+
+        def normalize_year(token: str) -> int:
+            value = int(token)
+            if value < 100:
+                return 2000 + value if value < 50 else 1900 + value
+            return value
+
+        def build_date(day_token: str, month_token: str, year_token: str) -> Optional[date]:
+            try:
+                year_value = normalize_year(year_token)
+                return date(year_value, int(month_token), int(day_token))
+            except ValueError:
+                return None
+
+        match = re.search(r"\b(\d{1,2})[\/\.-](\d{1,2})[\/\.-](\d{2,4})\b", normalized_text)
+        if match:
+            candidate = build_date(match.group(1), match.group(2), match.group(3))
+            if candidate:
+                return candidate
+
+        match = re.search(r"\b(\d{4})[\/\.-](\d{1,2})[\/\.-](\d{1,2})\b", normalized_text)
+        if match:
+            try:
+                candidate = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            except ValueError:
+                candidate = None
+            if candidate:
+                return candidate
+
+        month_names = {
+            "janeiro": 1,
+            "fevereiro": 2,
+            "marco": 3,
+            "abril": 4,
+            "maio": 5,
+            "junho": 6,
+            "julho": 7,
+            "agosto": 8,
+            "setembro": 9,
+            "outubro": 10,
+            "novembro": 11,
+            "dezembro": 12,
+        }
+        match = re.search(
+            r"\b(\d{1,2})\s+de\s+(janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(\d{4})",
+            normalized_text,
+        )
+        if match:
+            day_token, month_name, year_token = match.groups()
+            month_value = month_names.get(month_name)
+            if month_value:
+                try:
+                    candidate = date(int(year_token), month_value, int(day_token))
+                except ValueError:
+                    candidate = None
+                if candidate:
+                    return candidate
+
+        return None
+
+    @staticmethod
     def _detect_currency_codes(normalized_text: str) -> List[str]:
         keywords = {
             "dolar": "USD",
@@ -554,80 +748,3 @@ class BotApp:
 
         return sorted(detected)
 
-    def _fetch_currency_data(self, codes: Sequence[str]) -> Optional[str]:
-        if not codes:
-            return None
-
-        pairs = ",".join(f"{code}-BRL" for code in codes)
-        url = f"https://economia.awesomeapi.com.br/json/last/{pairs}"
-
-        response = requests.get(url, timeout=self.settings.request_timeout)
-        response.raise_for_status()
-        payload = response.json()
-
-        lines: List[str] = []
-        timestamp_display: Optional[str] = None
-
-        for code in codes:
-            key = f"{code}BRL"
-            info = payload.get(key)
-            if not isinstance(info, dict):
-                continue
-
-            price_raw = info.get("bid") or info.get("ask")
-            variation_raw = info.get("pctChange")
-            update_reference = info.get("create_date") or info.get("timestamp")
-
-            if price_raw is None:
-                continue
-
-            try:
-                price_value = float(str(price_raw).replace(",", "."))
-                price_text = f"R$ {price_value:.4f}"
-            except (TypeError, ValueError):
-                price_text = str(price_raw)
-
-            variation_text = ""
-            if variation_raw is not None:
-                try:
-                    variation_value = float(str(variation_raw).replace(",", "."))
-                    variation_text = f" (variacao diaria: {variation_value:+.2f}%)"
-                except (TypeError, ValueError):
-                    variation_text = f" (variacao diaria: {variation_raw})"
-
-            if update_reference and not timestamp_display:
-                timestamp_display = self._format_timestamp(update_reference)
-
-            lines.append(f"- {code}/BRL: {price_text}{variation_text}")
-
-        if not lines:
-            return None
-
-        header = "[Contexto em tempo real]\nCotacoes consultadas via AwesomeAPI:"
-        body = "\n".join(lines)
-        if timestamp_display:
-            return f"{header}\n{body}\nDados consultados em {timestamp_display}."
-        return f"{header}\n{body}"
-
-    @staticmethod
-    def _format_timestamp(value: Any) -> str:
-        if isinstance(value, (int, float)):
-            dt = datetime.fromtimestamp(float(value))
-            return dt.strftime("%d/%m/%Y %H:%M:%S")
-
-        text = str(value)
-        if text.isdigit():
-            try:
-                dt = datetime.fromtimestamp(int(text))
-                return dt.strftime("%d/%m/%Y %H:%M:%S")
-            except (OSError, OverflowError, ValueError):
-                return text
-
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%z"):
-            try:
-                dt = datetime.strptime(text, fmt)
-                return dt.strftime("%d/%m/%Y %H:%M:%S")
-            except ValueError:
-                continue
-
-        return text

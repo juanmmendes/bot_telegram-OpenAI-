@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 
@@ -16,6 +18,8 @@ class Settings:
     request_timeout: int = 20
     response_buffer_seconds: float = 2.5
     openai_transcription_model: str = "gpt-4o-mini-transcribe"
+    chat_state_dir: Optional[str] = None
+    metrics_file_path: Optional[str] = None
 
 
 def get_settings(env_path: Optional[str] = None) -> Settings:
@@ -30,6 +34,9 @@ def get_settings(env_path: Optional[str] = None) -> Settings:
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
     transcription_model = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
     buffer_value = os.getenv("RESPONSE_BUFFER_SECONDS", "").strip()
+    chat_state_dir = os.getenv("CHAT_STATE_DIR", "").strip() or None
+    metrics_file_path = os.getenv("METRICS_FILE", "").strip() or None
+
     if buffer_value:
         try:
             response_buffer_seconds = float(buffer_value)
@@ -37,6 +44,9 @@ def get_settings(env_path: Optional[str] = None) -> Settings:
             raise RuntimeError("RESPONSE_BUFFER_SECONDS deve ser um numero (ex.: 2.5).") from exc
     else:
         response_buffer_seconds = 2.5
+
+    if not metrics_file_path and chat_state_dir:
+        metrics_file_path = str(Path(chat_state_dir) / "metrics.json")
 
     missing = []
     if not telegram_token:
@@ -57,4 +67,6 @@ def get_settings(env_path: Optional[str] = None) -> Settings:
         openai_model=openai_model,
         response_buffer_seconds=response_buffer_seconds,
         openai_transcription_model=transcription_model,
+        chat_state_dir=chat_state_dir,
+        metrics_file_path=metrics_file_path,
     )
