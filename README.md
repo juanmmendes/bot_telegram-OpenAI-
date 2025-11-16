@@ -108,15 +108,15 @@ Usuario -> Telegram -> BotApp -> Buffer -> Contexto -> OpenAI -> Telegram -> Usu
 
 ```mermaid
 flowchart TD
-    U["Usuario"]
-    TG["Telegram API"]
-    BA["BotApp"]
-    Buffer["ChatState / Buffer"]
-    Currency["CurrencyService"]
-    OpenAIClient["OpenAI Client"]
+    U[Usuario]
+    TG[Telegram API]
+    BA[BotApp]
+    Buffer[ChatState / Buffer]
+    Currency[CurrencyService]
+    OpenAIClient[OpenAI Client]
 
     U -->|mensagem| TG
-    TG -->|update (long polling)| BA
+    TG -->|update long polling| BA
     BA -->|pendente| Buffer
     Buffer -->|contexto vivo| Currency
     Buffer -->|historico| OpenAIClient
