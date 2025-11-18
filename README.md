@@ -138,4 +138,4 @@ flowchart TD
 - [ ] Testes de texto, audio e imagem confirmando funcionamento
 - [ ] Cotacoes retornando dados da AwesomeAPI
 - [ ] Consultas historicas retornando dados da PTAX quando a data e informada
-- [ ] README suficientemente claro para apresentar o projeto
+
